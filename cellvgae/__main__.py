@@ -32,7 +32,7 @@ from sklearn.preprocessing import MinMaxScaler
 from termcolor import colored
 
 from cellvgae import CellVGAE, CellVGAE_Encoder, CellVGAE_GCNEncoder, compute_mmd
-
+from ubergauss import tools
 
 def _user_prompt() -> bool:
     # Credit for function: https://stackoverflow.com/a/50216611
@@ -53,10 +53,16 @@ def _preprocess_raw_counts(adata):
 
 
 def _load_input_file(path):
-    if path[-5:] == '.h5ad':
+
+    print('stupidpath = ',path)
+    if path.endswith('.h5'):
         adata = anndata.read_h5ad(path)
+        if adata.X.shape[0] > 5000:
+            sc.pp.subsample(adata, n_obs = 5000)
     elif path[-4:] == '.csv':
         adata = anndata.read_csv(path)
+    else:
+        adata = anndata.read_h5ad(path)
     return adata
 
 
@@ -86,8 +92,18 @@ def _prepare_training_data(args):
 
     adata_hvg = adata_pp.copy()
     adata_khvg = adata_pp.copy()
-    sc.pp.highly_variable_genes(adata_hvg, n_top_genes=args['hvg'], inplace=True, flavor='seurat')
-    sc.pp.highly_variable_genes(adata_khvg, n_top_genes=args['khvg'], inplace=True, flavor='seurat')
+    if args['genesaveload'] == 'load':
+        hv, khv = tools.loadfile(args['genesaveloadpath'])
+        adata_hvg.var['highly_variable']=hv
+        adata_khvg.var['highly_variable']=khv
+    else:
+        sc.pp.highly_variable_genes(adata_hvg, n_top_genes=args['hvg'], inplace=True, flavor='seurat')
+        sc.pp.highly_variable_genes(adata_khvg, n_top_genes=args['khvg'], inplace=True, flavor='seurat')
+
+    if args['genesaveload'] == 'save':
+        hv=adata_hvg.var['highly_variable'].values
+        khv=adata_khvg.var['highly_variable'].values
+        tools.dumpfile((hv,khv),args['genesaveloadpath'])
 
     adata_hvg = adata_hvg[:, adata_hvg.var['highly_variable'].values]
     adata_khvg = adata_khvg[:, adata_khvg.var['highly_variable'].values]
@@ -160,7 +176,7 @@ def _correlation(data_numpy, k, corr_type='pearson'):
 
 
 def _prepare_graphs(adata_khvg, X_khvg, args):
-    if args['graph_type'] == 'KNN Scanpy':
+    if args['graph_type'] == 'KNNSCANPY':
         print('Computing KNN Scanpy graph ("{}" metric)...'.format(args['graph_metric']))
         distances = sc.pp.neighbors(adata_khvg, n_neighbors=args['k'] + 1, n_pcs=args['graph_n_pcs'], knn=True, metric=args['graph_metric'], copy=True).obsp['distances'].A
 
@@ -199,7 +215,7 @@ def _prepare_graphs(adata_khvg, X_khvg, args):
 
         num_hvg = X_khvg.shape[1]
         k_file = args['k']
-        if args['graph_type'] == 'KNN Scanpy':
+        if args['graph_type'] == 'KNNSCANPY':
             graph_name = 'Scanpy'
         elif args['graph_type'] == 'KNN Faiss':
             graph_name = 'Faiss'
@@ -310,7 +326,7 @@ def _setup(args, device):
     edge_index = to_undirected(torch.from_numpy(edge_index).to(torch.long), num_nodes)
 
     scaler = MinMaxScaler()
-    scaled_x = torch.from_numpy(scaler.fit_transform(X_hvg))
+    scaled_x = torch.from_numpy(scaler.fit_transform(X_hvg.todense()))
 
     data_obj = Data(edge_index=edge_index, x=scaled_x)
     data_obj.num_nodes = X_hvg.shape[0]
@@ -385,9 +401,11 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(prog='train', description='Train CellVGAE.')
 
     parser.add_argument('--input_gene_expression_path', help='Input gene expression file path.')
+    parser.add_argument('--genesaveload', type=str, help='smautners hacks', default='No')
+    parser.add_argument('--genesaveloadpath', type=str, help='smautners hacks', default='No')
     parser.add_argument('--hvg', type=int, help='Number of HVGs.')
     parser.add_argument('--khvg', type=int, help='Number of KHVGs.')
-    parser.add_argument('--graph_type', choices=['KNN Scanpy', 'KNN Faiss', 'PKNN'], help='Type of graph.')
+    parser.add_argument('--graph_type', choices=['KNNSCANPY', 'KNN Faiss', 'PKNN'], help='Type of graph.')
     parser.add_argument('--k', type=int, help='K for KNN or Pearson (PKNN) graph.')
     parser.add_argument('--graph_n_pcs', type=int, help='Use this many Principal Components for the KNN (only Scanpy).')
     parser.add_argument('--graph_metric', choices=['euclidean', 'manhattan', 'cosine'], required=False)
@@ -419,7 +437,6 @@ if __name__ == '__main__':
     parser.add_argument('--load_model_path', help='Path to previously saved PyTorch state_dict object.')
 
     args = parser.parse_args()
-
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     args = vars(args)
@@ -490,7 +507,7 @@ if __name__ == '__main__':
     if (args['hvg'] and not args['khvg']) or (args['khvg'] and not args['hvg']):
         raise ValueError('--hvg and --khvg must be specified simultaneously.')
 
-    if (args['graph_n_pcs']) and (args['graph_type'] != 'KNN Scanpy'):
+    if (args['graph_n_pcs']) and (args['graph_type'] != 'KNNSCANPY'):
         raise ValueError('--graph_n_pcs is valid only for the "KNN Scanpy" graph type.')
 
     if (args['hdbscan']) and (not args['umap']):
@@ -538,17 +555,27 @@ if __name__ == '__main__':
         model.load_state_dict(torch.load(args['load_model_path']))
     else:
         print('Training model...')
-        for epoch in tqdm(range(1, args['epochs'] + 1)):
+        epoch = 0
+        best_loss = 9999999999,0,0
+        while True:
+            if epoch > args['epochs'] or (epoch - best_loss[1]) > 55:
+                print("BRK")
+                break
+            epoch +=1 #for epoch in tqdm(range(1, args['epochs'] + 1)):
             epoch_loss, decoder_loss = _train(model, optimizer, train_data, args['loss'], device=device, use_decoder_loss=args['use_linear_decoder'], conv_type=args['graph_convolution'])
+
+
+            if best_loss[0] > epoch_loss:
+                best_loss = epoch_loss, epoch, model
             if args['use_linear_decoder']:
                 print('Epoch {:03d} -- Total epoch loss: {:.4f} -- NN decoder epoch loss: {:.4f}'.format(epoch, epoch_loss, decoder_loss))
             else:
-                print('Epoch {:03d} -- Total epoch loss: {:.4f}'.format(epoch, epoch_loss))
+                print('Epoch {:03d} -- Total epoch loss: {:.4f}  since_best {}'.format(epoch, epoch_loss,epoch -best_loss[1] ))
 
             if args['val_split']:
                 auroc, ap, _ = _test(model=model, device=device, data=val_data, graph_conv=conv_type)
                 print('Validation AUROC {:.4f} -- AP {:.4f}.'.format(auroc, ap))
-
+        model = best_loss[2]
     if (args['load_model_path'] is not None):
         # Need to store testing data as training as PyTorch Geometric does not allow 0 training samples (all test).
         auroc, ap, z_nodes_test = _test(model=model, device=device, data=train_data, graph_conv=conv_type)
@@ -562,9 +589,9 @@ if __name__ == '__main__':
     # Save node embeddings
     model = model.eval()
     node_embeddings = []
-
     if (args['load_model_path'] is not None):
         node_embeddings = z_nodes_test.cpu().detach().numpy()
+        print(f"{ node_embeddings=}")
     else:
         x, edge_index = train_data.x.to(torch.float).to(device), train_data.edge_index.to(torch.long).to(device)
         if args['graph_convolution'] in ['GAT', 'GATv2']:
