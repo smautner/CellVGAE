@@ -34,6 +34,13 @@ from termcolor import colored
 from cellvgae import CellVGAE, CellVGAE_Encoder, CellVGAE_GCNEncoder, compute_mmd
 from ubergauss import tools
 
+
+from torch.optim.lr_scheduler import MultiStepLR
+
+
+def getLR(optimizer):
+ return [pg['lr']  for pg in optimizer.param_groups]
+
 def _user_prompt() -> bool:
     # Credit for function: https://stackoverflow.com/a/50216611
     """ Prompt the yes/no-*question* to the user. """
@@ -557,24 +564,25 @@ if __name__ == '__main__':
         print('Training model...')
         epoch = 0
         best_loss = 9999999999,0,0
+        print("USING MULTISTEP LR")
+        sheduler = MultiStepLR(optimizer,[20,100],gamma = .1)
         while True:
             if epoch > args['epochs'] or (epoch - best_loss[1]) > 55:
                 print("BRK")
                 break
             epoch +=1 #for epoch in tqdm(range(1, args['epochs'] + 1)):
             epoch_loss, decoder_loss = _train(model, optimizer, train_data, args['loss'], device=device, use_decoder_loss=args['use_linear_decoder'], conv_type=args['graph_convolution'])
-
-
             if best_loss[0] > epoch_loss:
                 best_loss = epoch_loss, epoch, model
             if args['use_linear_decoder']:
                 print('Epoch {:03d} -- Total epoch loss: {:.4f} -- NN decoder epoch loss: {:.4f}'.format(epoch, epoch_loss, decoder_loss))
             else:
-                print('Epoch {:03d} -- Total epoch loss: {:.4f}  since_best {}'.format(epoch, epoch_loss,epoch -best_loss[1] ))
+                print('Epoch {:03d} -- Total epoch loss: {:.4f}  since_best {} lr {}'.format(epoch, epoch_loss,epoch -best_loss[1], getLR(optimizer)))
 
             if args['val_split']:
                 auroc, ap, _ = _test(model=model, device=device, data=val_data, graph_conv=conv_type)
                 print('Validation AUROC {:.4f} -- AP {:.4f}.'.format(auroc, ap))
+            sheduler.step()
         model = best_loss[2]
     if (args['load_model_path'] is not None):
         # Need to store testing data as training as PyTorch Geometric does not allow 0 training samples (all test).
